@@ -230,7 +230,6 @@ async def process_buy(call: types.CallbackQuery):
     user = call.from_user
     try:
         session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
             mode="payment",
             client_reference_id=str(user.id),
             line_items=[{
