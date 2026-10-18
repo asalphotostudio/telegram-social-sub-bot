@@ -26,8 +26,8 @@ from flask import Flask, request, abort
 from aiogram import Bot, Dispatcher, types, executor
 
 # ---------- Настройки ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-STRIPE_KEY = os.getenv("STRIPE_KEY")
+BOT_TOKEN = os.getenv("8923459305:AAGakZB337V9LYMvLxshSEc-guUy4GLkEOY")
+STRIPE_KEY = os.getenv("sk_test_51URu61Gq6tZIXOBOrrffBT6LGIeCJRJNZcwiQfrxdICT5rdwFvTuEQqrbVkyfL0MDX6SehYQPMiF8oLZX81YoHJn00oatpkpqd")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # необязательно
 BASE_URL = (os.getenv("BASE_URL") or "https://t.me").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "subscriptions.db")
