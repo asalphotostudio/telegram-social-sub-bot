@@ -61,6 +61,13 @@ PLANS = {
 }
 
 
+def as_dict(obj):
+    """Новые версии stripe возвращают не dict, а StripeObject - приводим к обычному dict."""
+    if hasattr(obj, "to_dict"):
+        return obj.to_dict()
+    return dict(obj)
+
+
 # ---------- База данных ----------
 def db():
     return sqlite3.connect(DB_PATH)
@@ -277,10 +284,10 @@ async def process_check(call: types.CallbackQuery):
     user_id, username, session_id, plan_id = row
 
     try:
-        session = stripe.checkout.Session.retrieve(session_id)
+        session = as_dict(stripe.checkout.Session.retrieve(session_id))
     except Exception as e:
-        print("Stripe retrieve error:", e)
-        await call.message.answer("Не удалось проверить оплату. Попробуйте через минуту.")
+        print("Stripe retrieve error:", e, flush=True)
+        await call.message.answer("Не удалось проверить оплату: " + str(e)[:300])
         return
 
     if session.get("payment_status") != "paid":
@@ -397,7 +404,7 @@ def stripe_webhook():
         return abort(400)
 
     if event["type"] == "checkout.session.completed":
-        s = event["data"]["object"]
+        s = as_dict(event["data"]["object"])
         meta = s.get("metadata") or {}
         plan_id = meta.get("plan_id")
         client_ref = s.get("client_reference_id")
