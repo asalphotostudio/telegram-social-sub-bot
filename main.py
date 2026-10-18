@@ -11,7 +11,7 @@ import stripe
 from aiogram import Bot, Dispatcher, types, executor
 
 BOT_TOKEN = os.getenv("8923459305:AAGakZB337V9LYMvLxshSEc-guUy4GLkEOY")
-STRIPE_KEY = os.getenv("STRIPE")
+STRIPE_KEY = os.getenv("STRIPE_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 BASE_URL = os.getenv("BASE_URL")  # https://your-domain.com
 
