@@ -26,8 +26,11 @@ from flask import Flask, request, abort
 from aiogram import Bot, Dispatcher, types, executor
 
 # ---------- Настройки ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-STRIPE_KEY = os.getenv("STRIPE_KEY")
+sys.stdout.reconfigure(line_buffering=True)  # чтобы print сразу попадал в логи
+
+# В getenv пишем ТОЛЬКО ИМЯ переменной. Сами значения лежат в Variables на хостинге.
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+STRIPE_KEY = (os.getenv("STRIPE_KEY") or "").strip()
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")  # необязательно
 BASE_URL = (os.getenv("BASE_URL") or "https://t.me").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "subscriptions.db")
@@ -247,8 +250,8 @@ async def process_buy(call: types.CallbackQuery):
             cancel_url=BASE_URL + "/cancel.html",
         )
     except Exception as e:
-        print("Stripe error:", e)
-        await call.message.answer("Ошибка при создании платежа. Попробуйте позже.")
+        print("Stripe error:", e, flush=True)
+        await call.message.answer("Ошибка при создании платежа: " + str(e)[:300])
         return
 
     pending_id = add_pending(user.id, user.username, session.id, plan_id)
