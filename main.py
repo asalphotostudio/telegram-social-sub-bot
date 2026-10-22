@@ -1,24 +1,24 @@
 # main.py
-# Магазин подписок в Telegram (aiogram 2.x) + оплата через Stripe Checkout.
+# Telegram shop bot (aiogram 2.x), English only.
 #
-# Интерфейс: постоянное нижнее меню (кнопки под полем ввода), 3 языка (RU / EN / UZ),
-# настройки пользователя, каталог с inline-кнопками, оформление заказа и уведомление продавцу.
+# Catalog:  Spotify (Individual / Platinum) and PlayStation Store top-ups (INR).
+# Payment:  manual. The buyer pays by Visa card transfer or crypto, uploads a screenshot,
+#           and presses "I've Paid" (the button only works after a screenshot is received).
+#           The screenshot goes to the admins as a "New order" with a Confirm / Reject button.
+# After the admin confirms:
+#           Spotify     -> the bot asks for the account email and password, then notifies the admins.
+#           PlayStation -> the buyer just waits; the order is already with the admins.
+# The admin marks the order "Completed" and the buyer is notified.
 #
-# Как это работает:
-#   1. Покупатель выбирает сервис и тариф, платит картой на странице Stripe.
-#   2. Возвращается в бота, нажимает "Я оплатил" - бот проверяет оплату у Stripe.
-#   3. Бот просит email и пароль от аккаунта для оформления подписки.
-#   4. Админу (продавцу) приходит "Новый заказ!" с данными и сроком.
-#   5. Продавец оформляет подписку и нажимает "Заказ выполнен" - покупателю уходит уведомление.
-#
-# Переменные окружения (Variables на хостинге):
-#   BOT_TOKEN   - токен от @BotFather            (обязательно)
-#   STRIPE_KEY  - секретный ключ Stripe sk_...   (обязательно)
-# Необязательные:
-#   ADMIN_IDS   - доп. админы через запятую
-#   SUPPORT_URL - ссылка на поддержку (по умолчанию https://t.me/Sainnapari)
-#   BASE_URL    - адрес сервиса для страниц success/cancel
-#   DB_PATH     - путь к SQLite (на Railway: /data/subscriptions.db при подключённом Volume)
+# Environment variables (Variables on your host):
+#   BOT_TOKEN       - token from @BotFather                    (required)
+# Optional:
+#   ADMIN_IDS       - extra admin Telegram IDs, comma separated
+#   SUPPORT_URL     - support link (default https://t.me/Sainnapari)
+#   SHOP_NAME       - shop name shown in the welcome message
+#   CARD_DETAILS    - default bank-card payment details (can also be edited in the Admin Panel)
+#   CRYPTO_DETAILS  - default crypto payment details   (can also be edited in the Admin Panel)
+#   DB_PATH         - SQLite path (use a Volume, e.g. /data/subscriptions.db, so data survives redeploys)
 
 import os
 import re
@@ -28,484 +28,72 @@ import sqlite3
 import threading
 from datetime import datetime
 
-import stripe
 from flask import Flask
 from aiogram import Bot, Dispatcher, types, executor
-from aiogram.utils.exceptions import MessageNotModified
+from aiogram.utils.exceptions import MessageNotModified  # noqa: F401  (kept for easy extension)
 
-sys.stdout.reconfigure(line_buffering=True)  # чтобы print сразу попадал в логи
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # make print() show up in host logs immediately
+except Exception:
+    pass
 
-# ---------- Настройки ----------
-# В getenv пишем ТОЛЬКО ИМЯ переменной. Сами значения лежат в Variables на хостинге.
+# ---------------------------------------------------------------- settings
+# os.getenv() takes the NAME of a variable. The values live in Variables on the host.
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-STRIPE_KEY = (os.getenv("STRIPE_KEY") or "").strip()
-BASE_URL = (os.getenv("BASE_URL") or "https://t.me").rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "subscriptions.db")
 SUPPORT_URL = os.getenv("SUPPORT_URL", "https://t.me/Sainnapari")
+SHOP_NAME = os.getenv("SHOP_NAME", "Subscription Store")
 
-# Админ по умолчанию + любые из переменной ADMIN_IDS
-ADMIN_IDS = {8292954392}
+ADMIN_IDS = {8292954392, 5060101097}
 for _x in os.getenv("ADMIN_IDS", "").split(","):
     _x = _x.strip()
     if _x.isdigit():
         ADMIN_IDS.add(int(_x))
 
-missing = [n for n, v in [("BOT_TOKEN", BOT_TOKEN), ("STRIPE_KEY", STRIPE_KEY)] if not v]
-if missing:
-    print("Не заданы переменные окружения: " + ", ".join(missing))
-    sys.exit(1)
+DEFAULT_CARD = os.getenv(
+    "CARD_DETAILS",
+    "Card number: 0000 0000 0000 0000\nCardholder: DEMO HOLDER\n\n(Demo details - the real ones will be added soon.)",
+)
+DEFAULT_CRYPTO = os.getenv(
+    "CRYPTO_DETAILS",
+    "Network: USDT (TRC20)\nAddress: DEMO-ADDRESS-REPLACE-ME\n\n(Demo details - the real ones will be added soon.)",
+)
 
-stripe.api_key = STRIPE_KEY
+if not BOT_TOKEN:
+    print("Missing environment variable: BOT_TOKEN")
+    sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN, parse_mode=types.ParseMode.HTML)
 dp = Dispatcher(bot)
 
 h = html.escape
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-LINE = "━━━━━━━━━━━━━━"
 
-# ---------- Языки ----------
-LANGS = ["ru", "en", "uz"]
-LANG_NAMES = {"ru": "🇷🇺 Русский", "en": "🇬🇧 English", "uz": "🇺🇿 Oʻzbekcha"}
-
-PERIOD_LABELS = {
-    "7d_t": {"ru": "7 дней (пробный)", "en": "7 days (trial)", "uz": "7 kun (sinov)"},
-    "30d_t": {"ru": "30 дней (пробный)", "en": "30 days (trial)", "uz": "30 kun (sinov)"},
-    "1d": {"ru": "1 день", "en": "1 day", "uz": "1 kun"},
-    "1w": {"ru": "1 неделя", "en": "1 week", "uz": "1 hafta"},
-    "1m": {"ru": "1 месяц", "en": "1 month", "uz": "1 oy"},
-    "12m": {"ru": "12 месяцев", "en": "12 months", "uz": "12 oy"},
-}
-
-T = {
-    "ru": {
-        "m_catalog": "🛍 Каталог",
-        "m_orders": "📦 Мои заказы",
-        "m_how": "📖 Как заказать",
-        "m_faq": "❓ FAQ",
-        "m_settings": "⚙️ Настройки",
-        "m_support": "💬 Поддержка",
-        "placeholder": "Выберите раздел меню",
-        "welcome": (
-            "<b>Добро пожаловать!</b>\n" + LINE + "\n"
-            "Подписки на <b>Adobe</b>, <b>Canva</b>, <b>Netflix</b> и <b>Crunchyroll</b>.\n\n"
-            "▫️ Оплата картой на защищённой странице Stripe\n"
-            "▫️ Оформление подписки на ваш аккаунт\n"
-            "▫️ Статус заказа — в разделе «Мои заказы»\n\n"
-            "Вопросы? <a href=\"{support}\">Служба поддержки</a>\n\n"
-            "Выберите раздел в меню ниже 👇"
-        ),
-        "catalog": "🛍 <b>Каталог</b>\n" + LINE + "\nВыберите сервис:",
-        "choose_level": "{emoji} <b>{title}</b>\n" + LINE + "\nВыберите уровень подписки:",
-        "choose_plan": "\n" + LINE + "\nВыберите тариф:",
-        "plan_card": (
-            "🧾 <b>{title}</b>\n" + LINE + "\n"
-            "▫️ Тариф: <b>{label}</b>\n"
-            "▫️ Срок: <b>{period}</b>\n"
-            "▫️ Цена: <b>{price}</b>\n" + LINE + "\n"
-            "После оплаты бот запросит <b>email</b> и <b>пароль</b> от вашего аккаунта для оформления подписки."
-        ),
-        "pay_btn": "💳 Оплатить {price}",
-        "paid_btn": "✅ Я оплатил",
-        "back": "⬅️ Назад",
-        "order_card": (
-            "🧾 <b>Заказ #{oid}</b>\n" + LINE + "\n"
-            "{title} — {label}\n"
-            "К оплате: <b>{price}</b>\n\n"
-            "<b>1.</b> Нажмите «Оплатить» и оплатите картой\n"
-            "<b>2.</b> Вернитесь сюда и нажмите «Я оплатил»"
-        ),
-        "pay_error": "⚠️ Не удалось создать платёж. Попробуйте позже или обратитесь в <a href=\"{support}\">поддержку</a>.",
-        "pay_not_yet": "Оплата пока не поступила. Оплатите по кнопке «Оплатить» и нажмите «Я оплатил» ещё раз.",
-        "pay_check_fail": "Не удалось проверить оплату. Попробуйте через минуту.",
-        "order_not_found": "Заказ не найден. Начните заново из каталога.",
-        "already_in_work": "Этот заказ уже принят в работу ✅",
-        "ask_email": (
-            "✅ <b>Оплата получена, спасибо!</b>\n\n"
-            "Для оформления подписки <b>{title}</b> отправьте <b>email</b> от вашего аккаунта одним сообщением 👇"
-        ),
-        "bad_email": "Это не похоже на email. Отправьте адрес в формате <code>name@mail.com</code>",
-        "ask_password": (
-            "Отлично! Теперь отправьте <b>пароль</b> от аккаунта 🔑\n\n"
-            "🔒 Пароль не сохраняется в базе бота, а ваше сообщение с ним удаляется из чата. "
-            "Данные передаются только продавцу для оформления заказа. "
-            "После оформления рекомендуем сменить пароль."
-        ),
-        "order_accepted": (
-            "🎉 <b>Заказ #{oid} принят!</b>\n" + LINE + "\n"
-            "Продавец оформит подписку, и вы получите уведомление здесь. "
-            "Статус заказа — в разделе «Мои заказы»."
-        ),
-        "admin_fail": (
-            "⚠️ Заказ #{oid} оплачен, но не удалось уведомить продавца. "
-            "Обратитесь в <a href=\"{support}\">поддержку</a> и назовите номер заказа."
-        ),
-        "order_done": (
-            "🎉 <b>Заказ #{oid} выполнен!</b>\n" + LINE + "\n"
-            "Подписка <b>{title}</b> оформлена. Приятного использования!\n"
-            "Вопросы — <a href=\"{support}\">поддержка</a>."
-        ),
-        "orders_title": "📦 <b>Мои заказы</b>\n" + LINE,
-        "no_orders": "Пока заказов нет. Откройте «🛍 Каталог», чтобы оформить первый.",
-        "st_new": "⏳ ожидает оплаты",
-        "st_wait_email": "✉️ ожидаем ваш email",
-        "st_wait_password": "🔑 ожидаем пароль",
-        "st_submitted": "🛠 в работе",
-        "st_done": "✅ выполнен",
-        "how": (
-            "📖 <b>Как заказать</b>\n" + LINE + "\n"
-            "<b>1.</b> Откройте «🛍 Каталог» и выберите сервис\n"
-            "<b>2.</b> Выберите тариф и нажмите «Оплатить»\n"
-            "<b>3.</b> Оплатите картой на странице Stripe\n"
-            "<b>4.</b> Вернитесь в бота и нажмите «Я оплатил»\n"
-            "<b>5.</b> Отправьте email и пароль от аккаунта\n"
-            "<b>6.</b> Продавец оформит подписку, вы получите уведомление\n\n"
-            "Следить за заказами можно в разделе «📦 Мои заказы»."
-        ),
-        "faq": (
-            "❓ <b>Частые вопросы</b>\n" + LINE + "\n"
-            "<b>Безопасна ли оплата?</b>\n"
-            "Оплата проходит на странице Stripe. Бот не видит и не хранит данные вашей карты.\n\n"
-            "<b>Зачем нужны email и пароль?</b>\n"
-            "Для оформления подписки на ваш аккаунт. Пароль не сохраняется в базе бота и передаётся только продавцу. "
-            "После оформления рекомендуем сменить пароль.\n\n"
-            "<b>Как узнать статус заказа?</b>\n"
-            "В разделе «📦 Мои заказы». Когда подписка будет оформлена, бот пришлёт уведомление.\n\n"
-            "<b>Что делать, если возник вопрос или проблема?</b>\n"
-            "Напишите в <a href=\"{support}\">поддержку</a> и укажите номер заказа. "
-            "Условия возврата также уточняйте у поддержки."
-        ),
-        "settings": (
-            "⚙️ <b>Настройки</b>\n" + LINE + "\n"
-            "👤 ID: <code>{uid}</code>\n"
-            "🌐 Язык: {lang}\n"
-            "🔔 Уведомления о заказах: {notif}\n"
-            "📦 Заказов: {n}"
-        ),
-        "s_lang": "🌐 Язык: {lang}",
-        "s_notif": "🔔 Уведомления: {state}",
-        "on": "вкл ✅",
-        "off": "выкл ⛔",
-        "choose_language": "🌐 <b>Выберите язык</b>\n" + LINE,
-        "lang_changed": "✅ Язык изменён: {lang}",
-        "support": (
-            "💬 <b>Поддержка</b>\n" + LINE + "\n"
-            "По вопросам оплаты и оформления заказа напишите нам. Если есть номер заказа — укажите его."
-        ),
-        "support_btn": "Написать в поддержку",
-        "unknown": "Выберите раздел в меню ниже 👇",
-        "notif_off_note": "Покупатель отключил уведомления, сообщение не отправлено.",
-    },
-    "en": {
-        "m_catalog": "🛍 Catalog",
-        "m_orders": "📦 My orders",
-        "m_how": "📖 How to order",
-        "m_faq": "❓ FAQ",
-        "m_settings": "⚙️ Settings",
-        "m_support": "💬 Support",
-        "placeholder": "Choose a menu section",
-        "welcome": (
-            "<b>Welcome!</b>\n" + LINE + "\n"
-            "Subscriptions for <b>Adobe</b>, <b>Canva</b>, <b>Netflix</b> and <b>Crunchyroll</b>.\n\n"
-            "▫️ Card payment on a secure Stripe page\n"
-            "▫️ Subscription activated on your account\n"
-            "▫️ Order status in the “My orders” section\n\n"
-            "Questions? <a href=\"{support}\">Support team</a>\n\n"
-            "Choose a section in the menu below 👇"
-        ),
-        "catalog": "🛍 <b>Catalog</b>\n" + LINE + "\nChoose a service:",
-        "choose_level": "{emoji} <b>{title}</b>\n" + LINE + "\nChoose a subscription level:",
-        "choose_plan": "\n" + LINE + "\nChoose a plan:",
-        "plan_card": (
-            "🧾 <b>{title}</b>\n" + LINE + "\n"
-            "▫️ Plan: <b>{label}</b>\n"
-            "▫️ Duration: <b>{period}</b>\n"
-            "▫️ Price: <b>{price}</b>\n" + LINE + "\n"
-            "After payment the bot will ask for the <b>email</b> and <b>password</b> of your account to activate the subscription."
-        ),
-        "pay_btn": "💳 Pay {price}",
-        "paid_btn": "✅ I have paid",
-        "back": "⬅️ Back",
-        "order_card": (
-            "🧾 <b>Order #{oid}</b>\n" + LINE + "\n"
-            "{title} — {label}\n"
-            "Amount due: <b>{price}</b>\n\n"
-            "<b>1.</b> Tap “Pay” and pay by card\n"
-            "<b>2.</b> Come back here and tap “I have paid”"
-        ),
-        "pay_error": "⚠️ Could not create the payment. Please try again later or contact <a href=\"{support}\">support</a>.",
-        "pay_not_yet": "Payment has not arrived yet. Pay using the “Pay” button and tap “I have paid” again.",
-        "pay_check_fail": "Could not check the payment. Please try again in a minute.",
-        "order_not_found": "Order not found. Please start again from the catalog.",
-        "already_in_work": "This order is already being processed ✅",
-        "ask_email": (
-            "✅ <b>Payment received, thank you!</b>\n\n"
-            "To activate <b>{title}</b>, send the <b>email</b> of your account in one message 👇"
-        ),
-        "bad_email": "That doesn't look like an email. Send it in the format <code>name@mail.com</code>",
-        "ask_password": (
-            "Great! Now send the account <b>password</b> 🔑\n\n"
-            "🔒 The password is not stored in the bot's database and your message with it is deleted from the chat. "
-            "The data goes only to the seller to process your order. "
-            "We recommend changing the password afterwards."
-        ),
-        "order_accepted": (
-            "🎉 <b>Order #{oid} accepted!</b>\n" + LINE + "\n"
-            "The seller will activate your subscription and you will be notified here. "
-            "Track the status in the “My orders” section."
-        ),
-        "admin_fail": (
-            "⚠️ Order #{oid} is paid, but the seller could not be notified. "
-            "Please contact <a href=\"{support}\">support</a> and give the order number."
-        ),
-        "order_done": (
-            "🎉 <b>Order #{oid} completed!</b>\n" + LINE + "\n"
-            "Your <b>{title}</b> subscription is activated. Enjoy!\n"
-            "Questions — <a href=\"{support}\">support</a>."
-        ),
-        "orders_title": "📦 <b>My orders</b>\n" + LINE,
-        "no_orders": "No orders yet. Open “🛍 Catalog” to place your first one.",
-        "st_new": "⏳ awaiting payment",
-        "st_wait_email": "✉️ waiting for your email",
-        "st_wait_password": "🔑 waiting for your password",
-        "st_submitted": "🛠 in progress",
-        "st_done": "✅ completed",
-        "how": (
-            "📖 <b>How to order</b>\n" + LINE + "\n"
-            "<b>1.</b> Open “🛍 Catalog” and choose a service\n"
-            "<b>2.</b> Choose a plan and tap “Pay”\n"
-            "<b>3.</b> Pay by card on the Stripe page\n"
-            "<b>4.</b> Return to the bot and tap “I have paid”\n"
-            "<b>5.</b> Send the account email and password\n"
-            "<b>6.</b> The seller activates the subscription and you get a notification\n\n"
-            "Track your orders in the “📦 My orders” section."
-        ),
-        "faq": (
-            "❓ <b>FAQ</b>\n" + LINE + "\n"
-            "<b>Is the payment secure?</b>\n"
-            "Payment is made on a Stripe page. The bot never sees or stores your card details.\n\n"
-            "<b>Why are email and password needed?</b>\n"
-            "To activate the subscription on your account. The password is not stored in the bot's database and goes only to the seller. "
-            "We recommend changing it afterwards.\n\n"
-            "<b>How do I check my order status?</b>\n"
-            "In the “📦 My orders” section. The bot will notify you when the subscription is activated.\n\n"
-            "<b>What if I have a question or a problem?</b>\n"
-            "Write to <a href=\"{support}\">support</a> and give your order number. "
-            "Please also ask support about refund terms."
-        ),
-        "settings": (
-            "⚙️ <b>Settings</b>\n" + LINE + "\n"
-            "👤 ID: <code>{uid}</code>\n"
-            "🌐 Language: {lang}\n"
-            "🔔 Order notifications: {notif}\n"
-            "📦 Orders: {n}"
-        ),
-        "s_lang": "🌐 Language: {lang}",
-        "s_notif": "🔔 Notifications: {state}",
-        "on": "on ✅",
-        "off": "off ⛔",
-        "choose_language": "🌐 <b>Choose your language</b>\n" + LINE,
-        "lang_changed": "✅ Language changed: {lang}",
-        "support": (
-            "💬 <b>Support</b>\n" + LINE + "\n"
-            "Write to us about payment or order questions. Include the order number if you have one."
-        ),
-        "support_btn": "Contact support",
-        "unknown": "Choose a section in the menu below 👇",
-        "notif_off_note": "The buyer turned notifications off, the message was not sent.",
-    },
-    "uz": {
-        "m_catalog": "🛍 Katalog",
-        "m_orders": "📦 Buyurtmalarim",
-        "m_how": "📖 Qanday buyurtma",
-        "m_faq": "❓ FAQ",
-        "m_settings": "⚙️ Sozlamalar",
-        "m_support": "💬 Yordam",
-        "placeholder": "Menyudan bo‘limni tanlang",
-        "welcome": (
-            "<b>Xush kelibsiz!</b>\n" + LINE + "\n"
-            "<b>Adobe</b>, <b>Canva</b>, <b>Netflix</b> va <b>Crunchyroll</b> obunalari.\n\n"
-            "▫️ Stripe xavfsiz sahifasida karta orqali to‘lov\n"
-            "▫️ Obuna sizning akkauntingizga rasmiylashtiriladi\n"
-            "▫️ Buyurtma holati — «Buyurtmalarim» bo‘limida\n\n"
-            "Savollar? <a href=\"{support}\">Yordam xizmati</a>\n\n"
-            "Quyidagi menyudan bo‘limni tanlang 👇"
-        ),
-        "catalog": "🛍 <b>Katalog</b>\n" + LINE + "\nXizmatni tanlang:",
-        "choose_level": "{emoji} <b>{title}</b>\n" + LINE + "\nObuna darajasini tanlang:",
-        "choose_plan": "\n" + LINE + "\nTarifni tanlang:",
-        "plan_card": (
-            "🧾 <b>{title}</b>\n" + LINE + "\n"
-            "▫️ Tarif: <b>{label}</b>\n"
-            "▫️ Muddat: <b>{period}</b>\n"
-            "▫️ Narx: <b>{price}</b>\n" + LINE + "\n"
-            "To‘lovdan so‘ng bot obunani rasmiylashtirish uchun akkauntingizning <b>email</b> va <b>parolini</b> so‘raydi."
-        ),
-        "pay_btn": "💳 To‘lash {price}",
-        "paid_btn": "✅ To‘lov qildim",
-        "back": "⬅️ Orqaga",
-        "order_card": (
-            "🧾 <b>Buyurtma #{oid}</b>\n" + LINE + "\n"
-            "{title} — {label}\n"
-            "To‘lov summasi: <b>{price}</b>\n\n"
-            "<b>1.</b> «To‘lash» tugmasini bosib, karta bilan to‘lang\n"
-            "<b>2.</b> Shu yerga qaytib, «To‘lov qildim» tugmasini bosing"
-        ),
-        "pay_error": "⚠️ To‘lovni yaratib bo‘lmadi. Keyinroq urinib ko‘ring yoki <a href=\"{support}\">yordamga</a> murojaat qiling.",
-        "pay_not_yet": "To‘lov hali kelmadi. «To‘lash» tugmasi orqali to‘lang va «To‘lov qildim» tugmasini yana bosing.",
-        "pay_check_fail": "To‘lovni tekshirib bo‘lmadi. Bir daqiqadan so‘ng urinib ko‘ring.",
-        "order_not_found": "Buyurtma topilmadi. Katalogdan qaytadan boshlang.",
-        "already_in_work": "Bu buyurtma allaqachon ishga olingan ✅",
-        "ask_email": (
-            "✅ <b>To‘lov qabul qilindi, rahmat!</b>\n\n"
-            "<b>{title}</b> obunasini rasmiylashtirish uchun akkauntingiz <b>emailini</b> bitta xabarda yuboring 👇"
-        ),
-        "bad_email": "Bu email'ga o‘xshamaydi. Manzilni <code>name@mail.com</code> formatida yuboring",
-        "ask_password": (
-            "Ajoyib! Endi akkaunt <b>parolini</b> yuboring 🔑\n\n"
-            "🔒 Parol bot bazasida saqlanmaydi, u yozilgan xabar esa chatdan o‘chiriladi. "
-            "Ma’lumotlar faqat buyurtmani rasmiylashtirish uchun sotuvchiga yuboriladi. "
-            "Rasmiylashtirilgandan so‘ng parolni almashtirishni tavsiya qilamiz."
-        ),
-        "order_accepted": (
-            "🎉 <b>Buyurtma #{oid} qabul qilindi!</b>\n" + LINE + "\n"
-            "Sotuvchi obunani rasmiylashtiradi va siz shu yerda xabar olasiz. "
-            "Holatni «Buyurtmalarim» bo‘limida kuzating."
-        ),
-        "admin_fail": (
-            "⚠️ Buyurtma #{oid} to‘langan, lekin sotuvchiga xabar yuborib bo‘lmadi. "
-            "<a href=\"{support}\">Yordamga</a> murojaat qilib, buyurtma raqamini ayting."
-        ),
-        "order_done": (
-            "🎉 <b>Buyurtma #{oid} bajarildi!</b>\n" + LINE + "\n"
-            "<b>{title}</b> obunasi rasmiylashtirildi. Foydalanishdan zavqlaning!\n"
-            "Savollar — <a href=\"{support}\">yordam</a>."
-        ),
-        "orders_title": "📦 <b>Buyurtmalarim</b>\n" + LINE,
-        "no_orders": "Hozircha buyurtmalar yo‘q. Birinchi buyurtma uchun «🛍 Katalog»ni oching.",
-        "st_new": "⏳ to‘lov kutilmoqda",
-        "st_wait_email": "✉️ emailingiz kutilmoqda",
-        "st_wait_password": "🔑 parolingiz kutilmoqda",
-        "st_submitted": "🛠 jarayonda",
-        "st_done": "✅ bajarildi",
-        "how": (
-            "📖 <b>Qanday buyurtma qilinadi</b>\n" + LINE + "\n"
-            "<b>1.</b> «🛍 Katalog»ni oching va xizmatni tanlang\n"
-            "<b>2.</b> Tarifni tanlab, «To‘lash»ni bosing\n"
-            "<b>3.</b> Stripe sahifasida karta bilan to‘lang\n"
-            "<b>4.</b> Botga qaytib, «To‘lov qildim»ni bosing\n"
-            "<b>5.</b> Akkaunt emaili va parolini yuboring\n"
-            "<b>6.</b> Sotuvchi obunani rasmiylashtiradi, siz xabar olasiz\n\n"
-            "Buyurtmalarni «📦 Buyurtmalarim» bo‘limida kuzatib boring."
-        ),
-        "faq": (
-            "❓ <b>Ko‘p beriladigan savollar</b>\n" + LINE + "\n"
-            "<b>To‘lov xavfsizmi?</b>\n"
-            "To‘lov Stripe sahifasida amalga oshadi. Bot karta ma’lumotlaringizni ko‘rmaydi va saqlamaydi.\n\n"
-            "<b>Email va parol nima uchun kerak?</b>\n"
-            "Obunani akkauntingizga rasmiylashtirish uchun. Parol bot bazasida saqlanmaydi va faqat sotuvchiga yuboriladi. "
-            "Rasmiylashtirilgandan so‘ng uni almashtirishni tavsiya qilamiz.\n\n"
-            "<b>Buyurtma holatini qanday bilaman?</b>\n"
-            "«📦 Buyurtmalarim» bo‘limida. Obuna rasmiylashtirilganda bot xabar yuboradi.\n\n"
-            "<b>Savol yoki muammo bo‘lsa-chi?</b>\n"
-            "<a href=\"{support}\">Yordamga</a> yozing va buyurtma raqamini ko‘rsating. "
-            "Pulni qaytarish shartlarini ham yordamdan so‘rang."
-        ),
-        "settings": (
-            "⚙️ <b>Sozlamalar</b>\n" + LINE + "\n"
-            "👤 ID: <code>{uid}</code>\n"
-            "🌐 Til: {lang}\n"
-            "🔔 Buyurtma bildirishnomalari: {notif}\n"
-            "📦 Buyurtmalar: {n}"
-        ),
-        "s_lang": "🌐 Til: {lang}",
-        "s_notif": "🔔 Bildirishnomalar: {state}",
-        "on": "yoq ✅",
-        "off": "o‘chiq ⛔",
-        "choose_language": "🌐 <b>Tilni tanlang</b>\n" + LINE,
-        "lang_changed": "✅ Til o‘zgartirildi: {lang}",
-        "support": (
-            "💬 <b>Yordam</b>\n" + LINE + "\n"
-            "To‘lov va buyurtma bo‘yicha savollar uchun bizga yozing. Buyurtma raqami bo‘lsa, ko‘rsating."
-        ),
-        "support_btn": "Yordamga yozish",
-        "unknown": "Quyidagi menyudan bo‘limni tanlang 👇",
-        "notif_off_note": "Xaridor bildirishnomalarni o‘chirgan, xabar yuborilmadi.",
-    },
-}
-
-MENU_KEYS = ["m_catalog", "m_orders", "m_how", "m_faq", "m_settings", "m_support"]
-MENU_ACTIONS = {}  # текст кнопки (на любом языке) -> ключ действия
-for _lg in LANGS:
-    for _k in MENU_KEYS:
-        MENU_ACTIONS[T[_lg][_k]] = _k
-
-
-def tr(lang, key, **kw):
-    s = T.get(lang, T["ru"]).get(key) or T["ru"][key]
-    return s.format(**kw) if kw else s
-
-
-def detect_lang(code):
-    code = (code or "").lower()
-    if code.startswith("uz"):
-        return "uz"
-    if code.startswith(("ru", "be", "uk", "kk", "ky", "tg")):
-        return "ru"
-    return "en"
-
-
-# ---------- Каталог ----------
-# Тариф: (id, метка (код периода или название тарифа), цена в центах, код срока)
+# ---------------------------------------------------------------- catalog
+# Plan tuple: (id, name or None, price in cents, duration in months or None)
 CATALOG = {
-    "adobe": {
-        "emoji": "📱", "title": "Adobe Creative Cloud Pro", "note": "Individual plan",
+    "spotify": {
+        "emoji": "🎧", "title": "Spotify", "note": "", "needs_credentials": True,
         "groups": [
-            {"title": None, "plans": [
-                ("adobe_7d", "7d_t", 200, "7d_t"),
-                ("adobe_1m", "1m", 1450, "1m"),
-                ("adobe_12m", "12m", 14600, "12m"),
+            {"title": "Individual", "emoji": "👤", "plans": [
+                ("sp_ind_1m", None, 300, 1),
+                ("sp_ind_12m", None, 1650, 12),
+            ]},
+            {"title": "Platinum", "emoji": "💎", "plans": [
+                ("sp_plat_1m", None, 700, 1),
+                ("sp_plat_25m", None, 1400, 2.5),
+                ("sp_plat_45m", None, 2000, 4.5),
             ]},
         ],
     },
-    "canva": {
-        "emoji": "⚪", "title": "Canva Pro", "note": "",
+    "ps": {
+        "emoji": "🎮", "title": "PlayStation", "note": "Store top-up (INR)", "needs_credentials": False,
         "groups": [
-            {"title": None, "plans": [
-                ("canva_30t", "30d_t", 200, "30d_t"),
-                ("canva_1d", "1d", 120, "1d"),
-                ("canva_1w", "1w", 250, "1w"),
-                ("canva_1m", "1m", 618, "1m"),
-                ("canva_12m", "12m", 4600, "12m"),
-            ]},
-        ],
-    },
-    "netflix": {
-        "emoji": "🎥", "title": "Netflix", "note": "",
-        "groups": [
-            {"title": None, "plans": [
-                # Срок для Netflix в прайсе не указан - поставлен 1 месяц, поправьте при необходимости
-                ("nf_premium", "Premium 4K", 1000, "1m"),
-                ("nf_mobile", "Mobile", 300, "1m"),
-                ("nf_basic", "Basic", 400, "1m"),
-                ("nf_standard", "Standard", 700, "1m"),
-            ]},
-        ],
-    },
-    "crunchy": {
-        "emoji": "⛩", "title": "Crunchyroll", "note": "",
-        "groups": [
-            {"title": "Fan", "plans": [
-                ("cr_fan_1m", "1m", 150, "1m"),
-                ("cr_fan_12m", "12m", 540, "12m"),
-            ]},
-            {"title": "Mega Fan", "plans": [
-                ("cr_mega_1m", "1m", 180, "1m"),
-                ("cr_mega_12m", "12m", 700, "12m"),
-            ]},
-            {"title": "Ultimate Fan", "plans": [
-                ("cr_ult_1m", "1m", 400, "1m"),
-                ("cr_ult_12m", "12m", 1270, "12m"),
+            {"title": None, "emoji": "", "plans": [
+                ("ps_1000", "1000 INR", 1700, None),
+                ("ps_2000", "2000 INR", 3000, None),
+                ("ps_3000", "3000 INR", 4500, None),
+                ("ps_4000", "4000 INR", 6000, None),
             ]},
         ],
     },
@@ -514,16 +102,24 @@ CATALOG = {
 PLANS = {}
 for _skey, _svc in CATALOG.items():
     for _gi, _grp in enumerate(_svc["groups"]):
-        for _pid, _label, _cents, _period in _grp["plans"]:
+        for _pid, _name, _cents, _months in _grp["plans"]:
             PLANS[_pid] = {
                 "svc": _skey, "gi": _gi, "group": _grp["title"],
-                "label_code": _label, "cents": _cents, "period_code": _period,
+                "name": _name, "cents": _cents, "months": _months,
             }
 
 
 def money(cents):
     s = f"{cents / 100:.2f}".rstrip("0").rstrip(".")
     return "$" + s
+
+
+def months_text(m):
+    return "1 month" if m == 1 else f"{m:g} months"
+
+
+def plan_label(p):
+    return p["name"] or months_text(p["months"])
 
 
 def plan_title(p):
@@ -533,30 +129,95 @@ def plan_title(p):
     return name
 
 
-def plabel(p, lang):
-    return PERIOD_LABELS.get(p["label_code"], {}).get(lang, p["label_code"])
+def plan_full(p):
+    return f"{plan_title(p)} - {plan_label(p)}"
 
 
-def pperiod(p, lang):
-    return PERIOD_LABELS[p["period_code"]][lang]
+def plan_btn_text(p):
+    return f"{plan_label(p)} - {money(p['cents'])}"
 
 
-def back_target(p):
-    """Куда ведёт кнопка 'Назад' с экрана тарифа."""
-    svc = CATALOG[p["svc"]]
-    if len(svc["groups"]) > 1:
-        return f"grp:{p['svc']}:{p['gi']}"
-    return f"svc:{p['svc']}"
+def todo_text(p):
+    if CATALOG[p["svc"]]["needs_credentials"]:
+        return f"Activate {plan_title(p)} for {months_text(p['months'])} on the buyer's account."
+    return f"Deliver the PlayStation Store top-up: {p['name']}."
 
 
-def as_dict(obj):
-    """Новые версии stripe возвращают не dict, а StripeObject - приводим к обычному dict."""
-    if hasattr(obj, "to_dict"):
-        return obj.to_dict()
-    return dict(obj)
+def needs_credentials(p):
+    return CATALOG[p["svc"]]["needs_credentials"]
 
 
-# ---------- База данных ----------
+# ---------------------------------------------------------------- buttons
+B_CATALOG = "🛍 Catalog"
+B_ORDERS = "📦 My Orders"
+B_PAYMENT = "💳 Payment"
+B_SUPPORT = "💬 Support"
+B_SETTINGS = "⚙️ Settings"
+B_ABOUT = "ℹ️ About"
+B_MENU = "🏠 Main Menu"
+B_BACK = "⬅️ Back"
+B_ORDER = "✅ Place Order"
+B_PAID = "✅ I've Paid"
+B_CANCEL = "❌ Cancel Order"
+B_CARD = "💳 Bank Card (Visa)"
+B_CRYPTO = "🪙 Crypto"
+B_CHANGE = "🔄 Change Method"
+B_PROFILE = "👤 Profile"
+B_RULES = "📜 Rules"
+B_PRIVACY = "🔒 Privacy"
+B_FAQ = "❓ FAQ"
+B_ADMIN = "🛠 Admin Panel"
+B_A_PENDING = "⏳ Pending Payments"
+B_A_ORDERS = "📋 All Orders"
+B_A_STATS = "📊 Stats"
+B_A_CARD = "💳 Card Details"
+B_A_CRYPTO = "🪙 Crypto Details"
+
+BTN = {
+    B_CATALOG: "catalog", B_ORDERS: "orders", B_PAYMENT: "payment", B_SUPPORT: "support",
+    B_SETTINGS: "settings", B_ABOUT: "about", B_MENU: "menu", B_BACK: "back",
+    B_ORDER: "order", B_PAID: "paid", B_CANCEL: "cancel", B_CARD: "card", B_CRYPTO: "crypto",
+    B_CHANGE: "change", B_PROFILE: "profile", B_RULES: "rules", B_PRIVACY: "privacy", B_FAQ: "faq",
+    B_ADMIN: "admin", B_A_PENDING: "a_pending", B_A_ORDERS: "a_orders", B_A_STATS: "a_stats",
+    B_A_CARD: "a_card", B_A_CRYPTO: "a_crypto",
+}
+SVC_BTN = {f"{svc['emoji']} {svc['title']}": skey for skey, svc in CATALOG.items()}
+
+STATUS_TEXT = {
+    "new": "⏳ Awaiting payment",
+    "claimed": "🕐 Payment under review",
+    "wait_email": "✉️ Waiting for your email",
+    "wait_password": "🔑 Waiting for your password",
+    "submitted": "🛠 In progress",
+    "done": "✅ Completed",
+    "cancelled": "🚫 Cancelled",
+}
+
+# per-user navigation state (in memory; after a restart the user simply lands on the main menu)
+ctx = {}
+
+
+def kb(*rows):
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for row in rows:
+        m.row(*[types.KeyboardButton(t) for t in row])
+    return m
+
+
+def ikb(*buttons):
+    m = types.InlineKeyboardMarkup()
+    m.row(*[types.InlineKeyboardButton(text=t, callback_data=d) for t, d in buttons])
+    return m
+
+
+def main_kb(uid):
+    rows = [[B_CATALOG, B_ORDERS], [B_PAYMENT, B_SUPPORT], [B_SETTINGS, B_ABOUT]]
+    if uid in ADMIN_IDS:
+        rows.append([B_ADMIN])
+    return kb(*rows)
+
+
+# ---------------------------------------------------------------- database
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -583,63 +244,68 @@ def init_db():
             paid_at TEXT
         )
     """)
+    existing = {r["name"] for r in conn.execute("PRAGMA table_info(orders)")}
+    for col in ("method", "proof_file_id", "proof_type", "claimed_at", "confirmed_at", "done_at"):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS bot_users (
+        CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            lang TEXT,
-            notify INTEGER DEFAULT 1,
+            username TEXT,
+            first_name TEXT,
             created_at TEXT
         )
     """)
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
     conn.close()
 
 
-def get_bot_user(user_id):
+def ensure_user(user):
     conn = db()
-    row = conn.execute("SELECT * FROM bot_users WHERE user_id = ?", (user_id,)).fetchone()
+    row = conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user.id,)).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO users(user_id, username, first_name, created_at) VALUES(?,?,?,?)",
+            (user.id, user.username or "", user.first_name or "", now_iso()),
+        )
+    else:
+        conn.execute(
+            "UPDATE users SET username = ?, first_name = ? WHERE user_id = ?",
+            (user.username or "", user.first_name or "", user.id),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_user_row(uid):
+    conn = db()
+    row = conn.execute("SELECT * FROM users WHERE user_id = ?", (uid,)).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def set_user_lang(user_id, lang):
+def get_setting(key, default=""):
     conn = db()
-    conn.execute(
-        "INSERT INTO bot_users(user_id, lang, notify, created_at) VALUES(?,?,1,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET lang = excluded.lang",
-        (user_id, lang, now_iso()),
-    )
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row["value"] if row and row["value"] else default
+
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, value))
     conn.commit()
     conn.close()
 
 
-def toggle_notify(user_id, default_lang):
-    u = get_bot_user(user_id)
-    if not u:
-        set_user_lang(user_id, default_lang)
-        u = get_bot_user(user_id)
-    new = 0 if u["notify"] else 1
+def create_order(user, pid, cents):
     conn = db()
-    conn.execute("UPDATE bot_users SET notify = ? WHERE user_id = ?", (new, user_id))
-    conn.commit()
-    conn.close()
-    return new
-
-
-def lang_of(user):
-    """Язык пользователя: сохранённый или определённый по языку Telegram."""
-    u = get_bot_user(user.id)
-    if u and u["lang"] in LANGS:
-        return u["lang"]
-    return detect_lang(user.language_code)
-
-
-def create_order(user, plan_id, cents):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
+    # an unpaid order is replaced when the buyer starts a new one
+    conn.execute("UPDATE orders SET status = 'cancelled' WHERE user_id = ? AND status = 'new'", (user.id,))
+    cur = conn.execute(
         "INSERT INTO orders(user_id, username, plan_id, price_cents, status, created_at) VALUES(?,?,?,?,?,?)",
-        (user.id, user.username or "", plan_id, cents, "new", now_iso()),
+        (user.id, user.username or "", pid, cents, "new", now_iso()),
     )
     oid = cur.lastrowid
     conn.commit()
@@ -656,20 +322,21 @@ def get_order(oid):
 
 def update_order(oid, **fields):
     keys = list(fields.keys())
-    sql = "UPDATE orders SET " + ", ".join(f"{k} = ?" for k in keys) + " WHERE id = ?"
+    sets = ", ".join(f"{k} = ?" for k in keys)
     conn = db()
-    conn.execute(sql, [fields[k] for k in keys] + [oid])
+    conn.execute(f"UPDATE orders SET {sets} WHERE id = ?", [fields[k] for k in keys] + [oid])
     conn.commit()
     conn.close()
 
 
-def claim_paid(oid):
-    """Атомарно переводит заказ из 'new' в 'wait_email'. True - если это сделали мы (защита от двойного нажатия)."""
+def transition(oid, from_statuses, to_status, **extra):
+    """Atomic status change. Returns True only for the caller that actually changed it."""
+    marks = ",".join("?" * len(from_statuses))
+    sets = ", ".join(["status = ?"] + [f"{k} = ?" for k in extra])
     conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE orders SET status = 'wait_email', paid_at = ? WHERE id = ? AND status = 'new'",
-        (now_iso(), oid),
+    cur = conn.execute(
+        f"UPDATE orders SET {sets} WHERE id = ? AND status IN ({marks})",
+        [to_status, *extra.values(), oid, *from_statuses],
     )
     ok = cur.rowcount > 0
     conn.commit()
@@ -677,22 +344,33 @@ def claim_paid(oid):
     return ok
 
 
-def get_awaiting_order(user_id):
+def pick_order(uid, statuses, newest=True):
+    marks = ",".join("?" * len(statuses))
+    direction = "DESC" if newest else "ASC"
     conn = db()
     row = conn.execute(
-        "SELECT * FROM orders WHERE user_id = ? AND status IN ('wait_email','wait_password') "
-        "ORDER BY id DESC LIMIT 1",
-        (user_id,),
+        f"SELECT * FROM orders WHERE user_id = ? AND status IN ({marks}) ORDER BY id {direction} LIMIT 1",
+        [uid, *statuses],
     ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def user_orders(user_id, limit=10):
+def user_orders(uid, limit=10):
     conn = db()
     rows = conn.execute(
-        "SELECT * FROM orders WHERE user_id = ? AND status != 'new' ORDER BY id DESC LIMIT ?",
-        (user_id, limit),
+        "SELECT * FROM orders WHERE user_id = ? AND status NOT IN ('new','cancelled') ORDER BY id DESC LIMIT ?",
+        (uid, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def orders_by_status(statuses, limit=20):
+    marks = ",".join("?" * len(statuses))
+    conn = db()
+    rows = conn.execute(
+        f"SELECT * FROM orders WHERE status IN ({marks}) ORDER BY id ASC LIMIT ?", [*statuses, limit]
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -705,478 +383,714 @@ def all_orders(limit=20):
     return [dict(r) for r in rows]
 
 
-# ---------- Клавиатуры ----------
-def btn(text, data=None, url=None):
-    if url:
-        return types.InlineKeyboardButton(text=text, url=url)
-    return types.InlineKeyboardButton(text=text, callback_data=data)
+def order_plan(order):
+    return PLANS.get(order["plan_id"])
 
 
-def menu_kb(lang):
-    """Постоянное нижнее меню (под полем ввода)."""
-    k = types.ReplyKeyboardMarkup(
-        resize_keyboard=True, row_width=2, input_field_placeholder=tr(lang, "placeholder")
+def order_name(order):
+    p = order_plan(order)
+    return plan_full(p) if p else f"Plan {order['plan_id']}"
+
+
+def method_name(method):
+    return {"card": "Bank card (Visa)", "crypto": "Crypto"}.get(method or "", "-")
+
+
+def who_html(uid, username=None, full_name=None):
+    label = h(full_name) if full_name else str(uid)
+    s = f'<a href="tg://user?id={uid}">{label}</a>'
+    if username:
+        s += f" (@{h(username)})"
+    return s + f" · ID <code>{uid}</code>"
+
+
+# ---------------------------------------------------------------- texts
+def welcome_text():
+    return (
+        f"👋 <b>Welcome to {h(SHOP_NAME)}!</b>\n\n"
+        "Spotify plans and PlayStation Store top-ups.\n\n"
+        "Choose a section from the menu below 👇\n\n"
+        f'Need help? Contact <a href="{SUPPORT_URL}">support</a>.'
     )
-    k.row(types.KeyboardButton(tr(lang, "m_catalog")), types.KeyboardButton(tr(lang, "m_orders")))
-    k.row(types.KeyboardButton(tr(lang, "m_how")), types.KeyboardButton(tr(lang, "m_faq")))
-    k.row(types.KeyboardButton(tr(lang, "m_settings")), types.KeyboardButton(tr(lang, "m_support")))
-    return k
 
 
-def language_kb(onboarding):
-    k = types.InlineKeyboardMarkup(row_width=1)
-    flag = 1 if onboarding else 0
-    for lg in LANGS:
-        k.add(btn(LANG_NAMES[lg], f"lang:{lg}:{flag}"))
-    return k
+MENU_TEXT = "🏠 <b>Main Menu</b>\n\nChoose a section 👇"
+
+PAYMENT_INFO = (
+    "💳 <b>How payment works</b>\n\n"
+    "1️⃣ Pick a plan in the catalog and press «✅ Place Order».\n"
+    "2️⃣ Choose a payment method: <b>bank card transfer (Visa)</b> or <b>crypto</b>.\n"
+    "3️⃣ Pay using the details shown and send a <b>screenshot</b> of the payment here.\n"
+    "4️⃣ Press «✅ I've Paid» - it works only after the screenshot is received.\n"
+    "5️⃣ The seller checks the payment and confirms it.\n"
+    "6️⃣ Spotify: send your account email and password. PlayStation: just wait for your order."
+)
 
 
-async def show(call, text, markup):
-    """Меняет текущее сообщение (чтобы меню не плодило новые сообщения)."""
-    try:
-        await call.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
-    except MessageNotModified:
-        pass
-    except Exception:
-        await call.message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+def about_text():
+    return (
+        "ℹ️ <b>About</b>\n\n"
+        f"{h(SHOP_NAME)} sells Spotify plans (Individual and Platinum) and PlayStation Store top-ups.\n\n"
+        "• Pay by Visa card transfer or crypto\n"
+        "• Every payment is verified manually by the seller\n"
+        "• Track your orders in «📦 My Orders»\n\n"
+        f'Questions? Contact <a href="{SUPPORT_URL}">support</a>.'
+    )
 
 
-def catalog_kb(lang):
-    k = types.InlineKeyboardMarkup(row_width=1)
-    for skey, svc in CATALOG.items():
-        k.add(btn(f"{svc['emoji']} {svc['title']}", f"svc:{skey}"))
-    return k
+def support_text():
+    return (
+        "💬 <b>Support</b>\n\n"
+        f'Write to us: <a href="{SUPPORT_URL}">open the support chat</a>.\n'
+        "Please include your order number if your question is about an order."
+    )
 
 
-def welcome_text(lang):
-    return tr(lang, "welcome", support=SUPPORT_URL)
+FAQ_TEXT = (
+    "❓ <b>FAQ</b>\n\n"
+    "<b>Which payment methods do you accept?</b>\nBank card transfer (Visa) and crypto.\n\n"
+    "<b>Why do I need to send a screenshot?</b>\nThe seller verifies every payment manually, so the order is submitted only together with proof of payment.\n\n"
+    "<b>What do you need for Spotify?</b>\nAfter your payment is confirmed, the email and password of the Spotify account the plan should be activated on.\n\n"
+    "<b>What do I do after paying for a PlayStation top-up?</b>\nNothing - your order goes to the seller, and you will be notified here when it is completed.\n\n"
+    "<b>How long does it take?</b>\nOrders are processed manually by the seller. You will get a message here as soon as yours is completed.\n\n"
+    f'<b>Something went wrong?</b>\nContact <a href="{SUPPORT_URL}">support</a> and mention your order number.'
+)
+
+RULES_TEXT = (
+    "📜 <b>Rules</b>\n\n"
+    "• An order is processed only after the seller has confirmed your payment.\n"
+    "• Send the exact amount and a clear screenshot of the payment.\n"
+    "• For Spotify we need your account email and password to activate the plan. "
+    "After activation we recommend changing your password.\n"
+    f'• Questions about an order - contact <a href="{SUPPORT_URL}">support</a> and give the order number.'
+)
+
+PRIVACY_TEXT = (
+    "🔒 <b>Privacy</b>\n\n"
+    "• The bot stores your Telegram ID and username, your orders and the email you send for Spotify.\n"
+    "• Payment screenshots and account details are forwarded to the seller to complete your order.\n"
+    "• Your password is not saved in the bot's database. The message with it is deleted from the chat "
+    "and sent to the seller once.\n"
+    "• After your plan is activated we recommend changing your password."
+)
+
+WAIT_NOTE = "Your order has been sent to the seller. Please wait - you will get a message here when it is completed. ⏳"
 
 
-async def send_welcome(message, lang):
-    await message.answer(welcome_text(lang), reply_markup=menu_kb(lang), disable_web_page_preview=True)
+# ---------------------------------------------------------------- helpers
+async def send(uid, text, markup=None):
+    return await bot.send_message(uid, text, reply_markup=markup, disable_web_page_preview=True)
 
 
-# ---------- /start и язык ----------
-@dp.message_handler(commands=["start", "menu"])
-async def cmd_start(message: types.Message):
-    user = message.from_user
-    if not get_bot_user(user.id):
-        # первый запуск - предлагаем выбрать язык
-        await message.answer(
-            "🌐 <b>Выберите язык · Choose language · Tilni tanlang</b>\n" + LINE,
-            reply_markup=language_kb(onboarding=True),
-        )
-        return
-    await send_welcome(message, lang_of(user))
+async def to_admins(text, markup=None, ids=None):
+    sent = 0
+    for aid in (ids if ids is not None else ADMIN_IDS):
+        try:
+            await bot.send_message(aid, text, reply_markup=markup, disable_web_page_preview=True)
+            sent += 1
+        except Exception as e:
+            # an admin must press /start in the bot once, otherwise Telegram won't let the bot write first
+            print(f"Could not message admin {aid}: {e}")
+    return sent
 
 
-@dp.message_handler(commands=["lang", "language"])
-async def cmd_lang(message: types.Message):
-    lang = lang_of(message.from_user)
-    await message.answer(tr(lang, "choose_language"), reply_markup=language_kb(onboarding=False))
+# ---------------------------------------------------------------- screens
+async def remind_awaiting(uid):
+    order = pick_order(uid, ("wait_email", "wait_password"), newest=False)
+    if order:
+        what = "email" if order["status"] == "wait_email" else "password"
+        await send(uid, f"📌 Order <b>#{order['id']}</b> is waiting for your Spotify account <b>{what}</b> - just send it as a message.")
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("lang:"))
-async def cb_set_lang(call: types.CallbackQuery):
-    await call.answer()
-    try:
-        _, lg, flag = call.data.split(":")
-    except ValueError:
-        return
-    if lg not in LANGS:
-        return
-    set_user_lang(call.from_user.id, lg)
-    try:
-        await call.message.delete()
-    except Exception:
-        pass
-    if flag == "1":
-        await send_welcome(call.message, lg)
-    else:
-        await call.message.answer(
-            tr(lg, "lang_changed", lang=LANG_NAMES[lg]), reply_markup=menu_kb(lg)
-        )
-        await send_settings(call.message, call.from_user, lg)
+async def screen_main(uid, text=None):
+    ctx[uid] = {"screen": "main"}
+    await send(uid, text or MENU_TEXT, main_kb(uid))
+    await remind_awaiting(uid)
 
 
-# ---------- Нижнее меню ----------
-@dp.message_handler(lambda m: m.text in MENU_ACTIONS)
-async def on_menu(message: types.Message):
-    user = message.from_user
-    lang = lang_of(user)
-    action = MENU_ACTIONS[message.text]
-
-    if action == "m_catalog":
-        await message.answer(tr(lang, "catalog"), reply_markup=catalog_kb(lang))
-
-    elif action == "m_orders":
-        await message.answer(orders_text(user.id, lang), disable_web_page_preview=True)
-
-    elif action == "m_how":
-        await message.answer(tr(lang, "how"))
-
-    elif action == "m_faq":
-        await message.answer(tr(lang, "faq", support=SUPPORT_URL), disable_web_page_preview=True)
-
-    elif action == "m_settings":
-        await send_settings(message, user, lang)
-
-    elif action == "m_support":
-        k = types.InlineKeyboardMarkup()
-        k.add(btn("💬 " + tr(lang, "support_btn"), url=SUPPORT_URL))
-        await message.answer(tr(lang, "support"), reply_markup=k)
+async def screen_catalog(uid):
+    ctx[uid] = {"screen": "catalog"}
+    rows = [[t] for t in SVC_BTN]
+    rows.append([B_MENU])
+    await send(uid, "🛍 <b>Catalog</b>\n\nChoose a service 👇", kb(*rows))
 
 
-# ---------- Настройки ----------
-def settings_content(user, lang):
-    u = get_bot_user(user.id)
-    notify_on = (u["notify"] if u else 1) == 1
-    state = tr(lang, "on") if notify_on else tr(lang, "off")
-    n = len(user_orders(user.id, 1000))
-    text = tr(lang, "settings", uid=user.id, lang=LANG_NAMES[lang], notif=state, n=n)
-    k = types.InlineKeyboardMarkup(row_width=1)
-    k.add(btn(tr(lang, "s_lang", lang=LANG_NAMES[lang]), "setlang"))
-    k.add(btn(tr(lang, "s_notif", state=state), "notif"))
-    return text, k
+async def screen_groups(uid, skey):
+    svc = CATALOG[skey]
+    ctx[uid] = {"screen": "groups", "svc": skey}
+    rows = [[f"{g['emoji']} {g['title']}"] for g in svc["groups"]]
+    rows.append([B_BACK, B_MENU])
+    await send(uid, f"{svc['emoji']} <b>{h(svc['title'])}</b>\n\nChoose your plan type 👇", kb(*rows))
 
 
-async def send_settings(message, user, lang):
-    text, k = settings_content(user, lang)
-    await message.answer(text, reply_markup=k)
-
-
-@dp.callback_query_handler(lambda c: c.data == "setlang")
-async def cb_open_lang(call: types.CallbackQuery):
-    await call.answer()
-    lang = lang_of(call.from_user)
-    await show(call, tr(lang, "choose_language"), language_kb(onboarding=False))
-
-
-@dp.callback_query_handler(lambda c: c.data == "notif")
-async def cb_notif(call: types.CallbackQuery):
-    lang = lang_of(call.from_user)
-    toggle_notify(call.from_user.id, lang)
-    await call.answer("✅")
-    text, k = settings_content(call.from_user, lang)
-    await show(call, text, k)
-
-
-# ---------- Каталог ----------
-@dp.callback_query_handler(lambda c: c.data == "cat")
-async def cb_catalog(call: types.CallbackQuery):
-    await call.answer()
-    lang = lang_of(call.from_user)
-    await show(call, tr(lang, "catalog"), catalog_kb(lang))
-
-
-def plans_screen(skey, gi, lang):
+async def screen_plans(uid, skey, gi):
     svc = CATALOG[skey]
     grp = svc["groups"][gi]
+    ctx[uid] = {"screen": "plans", "svc": skey, "gi": gi}
     title = f"{svc['emoji']} <b>{h(svc['title'])}</b>"
     if grp["title"]:
-        title += f" — <b>{h(grp['title'])}</b>"
+        title += f" - <b>{h(grp['title'])}</b>"
     if svc["note"]:
         title += f"\n<i>{h(svc['note'])}</i>"
-    k = types.InlineKeyboardMarkup(row_width=1)
-    for pid, label_code, cents, _period in grp["plans"]:
-        label = PERIOD_LABELS.get(label_code, {}).get(lang, label_code)
-        k.add(btn(f"{label} — {money(cents)}", f"plan:{pid}"))
-    k.add(btn(tr(lang, "back"), "cat" if len(svc["groups"]) == 1 else f"svc:{skey}"))
-    return title + tr(lang, "choose_plan"), k
+    rows = [[plan_btn_text(PLANS[pid])] for pid, _n, _c, _m in grp["plans"]]
+    rows.append([B_BACK, B_MENU])
+    await send(uid, title + "\n\nChoose a plan 👇", kb(*rows))
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("svc:"))
-async def cb_service(call: types.CallbackQuery):
-    await call.answer()
-    lang = lang_of(call.from_user)
-    skey = call.data.split(":", 1)[1]
-    svc = CATALOG.get(skey)
-    if not svc:
-        return
-    if len(svc["groups"]) == 1:
-        text, k = plans_screen(skey, 0, lang)
-        await show(call, text, k)
-        return
-    k = types.InlineKeyboardMarkup(row_width=1)
-    for gi, grp in enumerate(svc["groups"]):
-        k.add(btn(grp["title"], f"grp:{skey}:{gi}"))
-    k.add(btn(tr(lang, "back"), "cat"))
-    await show(call, tr(lang, "choose_level", emoji=svc["emoji"], title=h(svc["title"])), k)
+async def screen_service(uid, skey):
+    if len(CATALOG[skey]["groups"]) > 1:
+        await screen_groups(uid, skey)
+    else:
+        await screen_plans(uid, skey, 0)
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("grp:"))
-async def cb_group(call: types.CallbackQuery):
-    await call.answer()
-    lang = lang_of(call.from_user)
-    try:
-        _, skey, gi = call.data.split(":")
-        text, k = plans_screen(skey, int(gi), lang)
-    except Exception:
-        return
-    await show(call, text, k)
+async def screen_plan(uid, pid):
+    p = PLANS[pid]
+    ctx[uid] = {"screen": "plan", "svc": p["svc"], "gi": p["gi"], "pid": pid}
+    lines = [f"🧾 <b>{h(plan_title(p))}</b>", ""]
+    if p["months"]:
+        lines.append(f"Duration: <b>{months_text(p['months'])}</b>")
+    else:
+        lines.append(f"Top-up: <b>{h(p['name'])}</b>")
+    lines.append(f"Price: <b>{money(p['cents'])}</b>")
+    lines.append("")
+    if needs_credentials(p):
+        lines.append("After your payment is confirmed we will ask for your Spotify account email and password to activate the plan.")
+    else:
+        lines.append("After your payment is confirmed your order goes to the seller - nothing else is needed from you.")
+    lines.append("")
+    lines.append("Press «✅ Place Order» to continue.")
+    await send(uid, "\n".join(lines), kb([B_ORDER], [B_BACK, B_MENU]))
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("plan:"))
-async def cb_plan(call: types.CallbackQuery):
-    await call.answer()
-    lang = lang_of(call.from_user)
-    pid = call.data.split(":", 1)[1]
-    p = PLANS.get(pid)
-    if not p:
-        return
-    text = tr(
-        lang, "plan_card",
-        title=h(plan_title(p)), label=h(plabel(p, lang)),
-        period=h(pperiod(p, lang)), price=money(p["cents"]),
+async def screen_methods(uid, order):
+    ctx[uid] = {"screen": "methods", "oid": order["id"]}
+    update_order(order["id"], method=None, proof_file_id=None, proof_type=None)
+    text = (
+        f"🧾 <b>Order #{order['id']}</b>\n"
+        f"{h(order_name(order))}\n"
+        f"Total: <b>{money(order['price_cents'])}</b>\n\n"
+        "Choose a payment method 👇\n\n"
+        "💳 Bank card transfer (Visa)\n🪙 Crypto"
     )
-    k = types.InlineKeyboardMarkup(row_width=1)
-    k.add(btn(tr(lang, "pay_btn", price=money(p["cents"])), f"pay:{pid}"))
-    k.add(btn(tr(lang, "back"), back_target(p)))
-    await show(call, text, k)
+    await send(uid, text, kb([B_CARD, B_CRYPTO], [B_CANCEL], [B_MENU]))
 
 
-# ---------- Оплата ----------
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("pay:"))
-async def cb_pay(call: types.CallbackQuery):
-    await call.answer()
-    lang = lang_of(call.from_user)
-    pid = call.data.split(":", 1)[1]
-    p = PLANS.get(pid)
-    if not p:
-        return
-    user = call.from_user
-    oid = create_order(user, pid, p["cents"])
-    try:
-        session = stripe.checkout.Session.create(
-            mode="payment",
-            client_reference_id=str(user.id),
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "product_data": {"name": f"{plan_title(p)} - {plabel(p, 'en')}"},
-                    "unit_amount": p["cents"],
-                },
-                "quantity": 1,
-            }],
-            metadata={"order_id": str(oid), "plan_id": pid, "user_id": str(user.id)},
-            success_url=BASE_URL + "/success.html",
-            cancel_url=BASE_URL + "/cancel.html",
+async def screen_pay(uid, order, method):
+    update_order(order["id"], method=method)
+    ctx[uid] = {"screen": "pay", "oid": order["id"]}
+    if method == "card":
+        title = "💳 <b>Pay by bank card (Visa)</b>"
+        details = h(get_setting("card_details", DEFAULT_CARD))
+        how = f"Transfer <b>{money(order['price_cents'])}</b> to the card above and keep the receipt."
+    else:
+        title = "🪙 <b>Pay with crypto</b>"
+        details = h(get_setting("crypto_details", DEFAULT_CRYPTO))
+        how = (
+            f"Send the equivalent of <b>{money(order['price_cents'])}</b> to the address above "
+            "using the network shown. Network fees are paid by you."
         )
-    except Exception as e:
-        print("Stripe error:", e, flush=True)
-        await call.message.answer(tr(lang, "pay_error", support=SUPPORT_URL), disable_web_page_preview=True)
-        return
-
-    update_order(oid, session_id=session.id)
-    text = tr(
-        lang, "order_card",
-        oid=oid, title=h(plan_title(p)), label=h(plabel(p, lang)), price=money(p["cents"]),
+    text = (
+        f"{title}\n\n"
+        f"Order <b>#{order['id']}</b> - {h(order_name(order))}\n"
+        f"Amount: <b>{money(order['price_cents'])}</b>\n\n"
+        f"{details}\n\n"
+        f"1️⃣ {how}\n"
+        "2️⃣ Send a <b>screenshot</b> of the payment here in the chat 📎\n"
+        "3️⃣ Press «✅ I've Paid» - the button works only after the screenshot is received."
     )
-    k = types.InlineKeyboardMarkup(row_width=1)
-    k.add(btn(tr(lang, "pay_btn", price=money(p["cents"])), url=session.url))
-    k.add(btn(tr(lang, "paid_btn"), f"chk:{oid}"))
-    k.add(btn(tr(lang, "back"), f"plan:{pid}"))
-    await show(call, text, k)
+    await send(uid, text, kb([B_PAID], [B_CHANGE, B_CANCEL], [B_MENU]))
 
 
-def ask_email_text(order, lang):
-    p = PLANS[order["plan_id"]]
-    return tr(lang, "ask_email", title=h(plan_title(p)))
+async def screen_settings(uid, text=None):
+    ctx[uid] = {"screen": "settings"}
+    await send(uid, text or "⚙️ <b>Settings</b>\n\nYour profile, rules, privacy and answers to common questions 👇",
+               kb([B_PROFILE, B_RULES], [B_PRIVACY, B_FAQ], [B_BACK, B_MENU]))
 
 
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("chk:"))
-async def cb_check(call: types.CallbackQuery):
-    lang = lang_of(call.from_user)
+async def screen_admin(uid, text=None):
+    ctx[uid] = {"screen": "admin"}
+    await send(uid, text or "🛠 <b>Admin Panel</b>",
+               kb([B_A_PENDING, B_A_ORDERS], [B_A_STATS], [B_A_CARD, B_A_CRYPTO], [B_BACK, B_MENU]))
+
+
+async def show_orders(uid):
+    rows = user_orders(uid)
+    if not rows:
+        text = "📦 <b>My Orders</b>\n\nNo orders yet. Take a look at the catalog 🛍"
+    else:
+        lines = ["📦 <b>My Orders</b>\n"]
+        for r in rows:
+            lines.append(f"#{r['id']} · {h(order_name(r))} · {money(r['price_cents'])}\n   {STATUS_TEXT.get(r['status'], r['status'])}")
+        text = "\n".join(lines)
+    await send(uid, text, main_kb(uid))
+    ctx[uid] = {"screen": "main"}
+    await remind_awaiting(uid)
+
+
+async def show_profile(uid):
+    row = get_user_row(uid) or {}
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) AS n FROM orders WHERE user_id = ? AND status NOT IN ('new','cancelled')", (uid,)).fetchone()["n"]
+    conn.close()
+    username = f"@{h(row['username'])}" if row.get("username") else "-"
+    since = (row.get("created_at") or "")[:10] or "-"
+    text = (
+        "👤 <b>Profile</b>\n\n"
+        f"ID: <code>{uid}</code>\n"
+        f"Username: {username}\n"
+        f"Orders: <b>{n}</b>\n"
+        f"Member since: {since}"
+    )
+    await screen_settings(uid, text)
+
+
+# ---------------------------------------------------------------- order flow
+def admin_caption(order, extra=""):
+    p = order_plan(order)
+    todo = todo_text(p) if p else "Check the plan manually."
+    data_line = (
+        "🔐 Account data: will be requested after you confirm the payment."
+        if p and needs_credentials(p) else "🔐 Account data: not needed."
+    )
+    return (
+        f"🆕 <b>New order #{order['id']}</b>\n\n"
+        f"🎯 <b>To do:</b> {h(todo)}\n"
+        f"📦 Plan: {h(order_name(order))}\n"
+        f"💰 Amount paid: <b>{money(order['price_cents'])}</b> via {method_name(order.get('method'))}\n"
+        f"👤 Buyer: {who_html(order['user_id'], order.get('username'))}\n"
+        f"{data_line}\n\n"
+        "📸 Check the screenshot and the amount, then confirm or reject." + extra
+    )
+
+
+async def send_proof(aid, order, caption, markup):
+    fid, ftype = order.get("proof_file_id"), order.get("proof_type")
+    if fid and ftype == "document":
+        return await bot.send_document(aid, fid, caption=caption, reply_markup=markup)
+    if fid:
+        return await bot.send_photo(aid, fid, caption=caption, reply_markup=markup)
+    return await bot.send_message(aid, caption, reply_markup=markup)
+
+
+async def send_claim(order, ids=None):
+    markup = ikb(("✅ Confirm payment", f"ap:{order['id']}"), ("❌ Reject", f"rj:{order['id']}"))
+    caption = admin_caption(order)
+    sent = 0
+    for aid in (ids if ids is not None else ADMIN_IDS):
+        try:
+            await send_proof(aid, order, caption, markup)
+            sent += 1
+        except Exception as e:
+            print(f"Could not send order {order['id']} to admin {aid}: {e}")
+    return sent
+
+
+async def handle_paid(user):
+    uid = user.id
+    order = pick_order(uid, ("new",))
+    if not order:
+        if pick_order(uid, ("claimed",)):
+            await send(uid, "Your payment is already being checked by the seller. Please wait for the confirmation 🙏")
+        else:
+            await send(uid, "You have no order waiting for payment. Choose a plan in the catalog 🛍", main_kb(uid))
+        return
+    if not order.get("method"):
+        await screen_methods(uid, order)
+        return
+    if not order.get("proof_file_id"):
+        await send(
+            uid,
+            "⚠️ <b>Screenshot required.</b>\n\nSend a screenshot of your payment here in the chat first - "
+            "«✅ I've Paid» works only after we receive it. 📎",
+        )
+        return
+    if not transition(order["id"], ("new",), "claimed", claimed_at=now_iso()):
+        return
+    order = get_order(order["id"])
+    if await send_claim(order) == 0:
+        transition(order["id"], ("claimed",), "new")
+        await send(uid, f'⚠️ We could not reach the seller. Please try again in a minute or contact <a href="{SUPPORT_URL}">support</a>.')
+        return
+    ctx[uid] = {"screen": "main"}
+    await send(
+        uid,
+        f"🕐 <b>Payment submitted</b> (order #{order['id']}).\n\nThe seller will check it and confirm. "
+        "You will get a message here as soon as it is confirmed.",
+        main_kb(uid),
+    )
+
+
+async def handle_cancel(uid):
+    order = pick_order(uid, ("new",))
+    if order:
+        transition(order["id"], ("new",), "cancelled")
+        await screen_main(uid, f"🚫 Order #{order['id']} was cancelled.\n\n" + MENU_TEXT)
+        return
+    claimed = pick_order(uid, ("claimed",))
+    if claimed:
+        await send(uid, f'Order #{claimed["id"]} is already with the seller and can no longer be cancelled here. Please contact <a href="{SUPPORT_URL}">support</a>.')
+        return
+    await screen_main(uid)
+
+
+# ---------------------------------------------------------------- handlers
+@dp.message_handler(commands=["start", "menu", "help"])
+async def cmd_start(message: types.Message):
+    ensure_user(message.from_user)
+    await screen_main(message.from_user.id, welcome_text() if message.get_command() == "/start" else None)
+
+
+@dp.message_handler(commands=["backup"])
+async def cmd_backup(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
     try:
-        oid = int(call.data.split(":", 1)[1])
-    except ValueError:
-        await call.answer()
-        return
-    order = get_order(oid)
-    if not order or order["user_id"] != call.from_user.id:
-        await call.answer(tr(lang, "order_not_found"), show_alert=True)
-        return
-
-    status = order["status"]
-    if status == "wait_email":
-        await call.answer()
-        await call.message.answer(ask_email_text(order, lang))
-        return
-    if status == "wait_password":
-        await call.answer()
-        await call.message.answer(tr(lang, "ask_password"))
-        return
-    if status in ("submitted", "done"):
-        await call.answer(tr(lang, "already_in_work"), show_alert=True)
-        return
-
-    # status == "new": проверяем оплату у Stripe
-    try:
-        session = as_dict(stripe.checkout.Session.retrieve(order["session_id"]))
+        await message.answer_document(types.InputFile(DB_PATH), caption="Database backup")
     except Exception as e:
-        print("Stripe retrieve error:", e, flush=True)
-        await call.answer(tr(lang, "pay_check_fail"), show_alert=True)
+        await message.answer(f"Backup failed: {h(str(e))}")
+
+
+@dp.message_handler(content_types=[types.ContentType.PHOTO, types.ContentType.DOCUMENT])
+async def on_proof(message: types.Message):
+    user = message.from_user
+    uid = user.id
+    ensure_user(user)
+    if message.photo:
+        file_id, ftype = message.photo[-1].file_id, "photo"
+    else:
+        mime = (message.document.mime_type or "")
+        if not (mime.startswith("image/") or mime == "application/pdf"):
+            await send(uid, "Please send the payment proof as a screenshot (image) or a PDF.")
+            return
+        file_id, ftype = message.document.file_id, "document"
+
+    order = pick_order(uid, ("new", "claimed"))
+    if not order:
+        await send(uid, "There is no order waiting for payment right now. Choose a plan in the catalog first 🛍", main_kb(uid))
         return
 
-    if session.get("payment_status") != "paid":
-        await call.answer(tr(lang, "pay_not_yet"), show_alert=True)
+    if order["status"] == "claimed":
+        # extra proof for an order that is already under review -> forward to admins
+        fake = dict(order, proof_file_id=file_id, proof_type=ftype)
+        cap = f"📎 <b>Additional proof for order #{order['id']}</b>\nBuyer: {who_html(uid, user.username)}"
+        for aid in ADMIN_IDS:
+            try:
+                await send_proof(aid, fake, cap, None)
+            except Exception as e:
+                print(f"Could not forward proof to admin {aid}: {e}")
+        await send(uid, f"📎 Extra screenshot forwarded to the seller (order #{order['id']}).")
         return
 
-    await call.answer()
-    if claim_paid(oid):
-        order = get_order(oid)
-        await call.message.answer(ask_email_text(order, lang))
+    if not order.get("method"):
+        await send(uid, "Please choose a payment method first 👇")
+        await screen_methods(uid, order)
+        return
+
+    update_order(order["id"], proof_file_id=file_id, proof_type=ftype)
+    ctx[uid] = {"screen": "pay", "oid": order["id"]}
+    await send(
+        uid,
+        f"✅ <b>Screenshot received</b> for order #{order['id']}.\n\nNow press «✅ I've Paid» to send it to the seller.",
+        kb([B_PAID], [B_CHANGE, B_CANCEL], [B_MENU]),
+    )
 
 
-# ---------- Получение email и пароля ----------
+async def handle_button(user, key, c):
+    uid = user.id
+    screen = c.get("screen")
+
+    if key == "menu":
+        await screen_main(uid)
+    elif key == "back":
+        if screen == "plan":
+            await screen_plans(uid, c["svc"], c["gi"])
+        elif screen == "plans":
+            if len(CATALOG[c["svc"]]["groups"]) > 1:
+                await screen_groups(uid, c["svc"])
+            else:
+                await screen_catalog(uid)
+        elif screen == "groups":
+            await screen_catalog(uid)
+        elif screen == "settings":
+            await screen_main(uid)
+        elif screen in ("set_card", "set_crypto"):
+            await screen_admin(uid)
+        else:
+            await screen_main(uid)
+    elif key == "catalog":
+        await screen_catalog(uid)
+    elif key == "orders":
+        await show_orders(uid)
+    elif key == "payment":
+        await send(uid, PAYMENT_INFO, main_kb(uid))
+        ctx[uid] = {"screen": "main"}
+    elif key == "support":
+        await send(uid, support_text(), main_kb(uid))
+        ctx[uid] = {"screen": "main"}
+    elif key == "about":
+        await send(uid, about_text(), main_kb(uid))
+        ctx[uid] = {"screen": "main"}
+    elif key == "settings":
+        await screen_settings(uid)
+    elif key == "profile":
+        await show_profile(uid)
+    elif key == "rules":
+        await screen_settings(uid, RULES_TEXT)
+    elif key == "privacy":
+        await screen_settings(uid, PRIVACY_TEXT)
+    elif key == "faq":
+        await screen_settings(uid, FAQ_TEXT)
+    elif key == "order":
+        p = PLANS.get(c.get("pid"))
+        if screen != "plan" or not p:
+            await screen_catalog(uid)
+            return
+        oid = create_order(user, c["pid"], p["cents"])
+        await screen_methods(uid, get_order(oid))
+    elif key in ("card", "crypto"):
+        order = pick_order(uid, ("new",))
+        if not order:
+            await screen_catalog(uid)
+            return
+        await screen_pay(uid, order, key)
+    elif key == "change":
+        order = pick_order(uid, ("new",))
+        if not order:
+            await screen_catalog(uid)
+            return
+        await screen_methods(uid, order)
+    elif key == "paid":
+        await handle_paid(user)
+    elif key == "cancel":
+        await handle_cancel(uid)
+    elif key.startswith("a_") or key == "admin":
+        if uid not in ADMIN_IDS:
+            await screen_main(uid)
+            return
+        await handle_admin_button(uid, key)
+
+
+async def handle_admin_button(uid, key):
+    if key == "admin":
+        await screen_admin(uid)
+    elif key == "a_pending":
+        rows = orders_by_status(("claimed",))
+        if not rows:
+            await send(uid, "✅ No payments are waiting for review.")
+            return
+        for o in rows:
+            await send_claim(o, ids=[uid])
+    elif key == "a_orders":
+        rows = all_orders()
+        if not rows:
+            await send(uid, "No orders yet.")
+            return
+        lines = ["📋 <b>Latest orders</b>\n"]
+        for r in rows:
+            who = f"@{h(r['username'])}" if r.get("username") else f"ID {r['user_id']}"
+            lines.append(f"#{r['id']} · {h(order_name(r))} · {money(r['price_cents'])} · {who}\n   {STATUS_TEXT.get(r['status'], r['status'])}")
+        await send(uid, "\n".join(lines)[:4000])
+    elif key == "a_stats":
+        conn = db()
+        counts = {r["status"]: r["n"] for r in conn.execute("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")}
+        rev = conn.execute(
+            "SELECT COALESCE(SUM(price_cents),0) AS s FROM orders WHERE status IN ('wait_email','wait_password','submitted','done')"
+        ).fetchone()["s"]
+        conn.close()
+        lines = ["📊 <b>Stats</b>\n"]
+        for st, label in STATUS_TEXT.items():
+            lines.append(f"{label}: <b>{counts.get(st, 0)}</b>")
+        lines.append(f"\n💰 Confirmed payments: <b>{money(rev)}</b>")
+        await send(uid, "\n".join(lines))
+    elif key in ("a_card", "a_crypto"):
+        kind = "card" if key == "a_card" else "crypto"
+        current = get_setting(f"{kind}_details", DEFAULT_CARD if kind == "card" else DEFAULT_CRYPTO)
+        ctx[uid] = {"screen": f"set_{kind}"}
+        await send(
+            uid,
+            f"{'💳' if kind == 'card' else '🪙'} <b>Current {kind} details:</b>\n\n{h(current)}\n\n"
+            "Send the new details as one message. Send <code>-</code> to restore the default. "
+            "Press «⬅️ Back» to keep them as they are.",
+            kb([B_BACK, B_MENU]),
+        )
+
+
 @dp.message_handler(lambda m: m.text and not m.text.startswith("/"))
 async def on_text(message: types.Message):
     user = message.from_user
-    lang = lang_of(user)
-    order = get_awaiting_order(user.id)
-    if not order:
-        await message.answer(tr(lang, "unknown"), reply_markup=menu_kb(lang))
+    uid = user.id
+    ensure_user(user)
+    text = message.text.strip()
+    c = ctx.get(uid) or {"screen": "main"}
+
+    key = BTN.get(text)
+    if key:
+        await handle_button(user, key, c)
         return
 
-    if order["status"] == "wait_email":
-        email = message.text.strip()
-        if not EMAIL_RE.match(email):
-            await message.answer(tr(lang, "bad_email"))
+    if text in SVC_BTN:
+        await screen_service(uid, SVC_BTN[text])
+        return
+
+    screen = c.get("screen")
+    if screen == "groups":
+        for gi, g in enumerate(CATALOG[c["svc"]]["groups"]):
+            if text == f"{g['emoji']} {g['title']}":
+                await screen_plans(uid, c["svc"], gi)
+                return
+    if screen == "plans":
+        grp = CATALOG[c["svc"]]["groups"][c["gi"]]
+        for pid, _n, _c, _m in grp["plans"]:
+            if text == plan_btn_text(PLANS[pid]):
+                await screen_plan(uid, pid)
+                return
+
+    if screen in ("set_card", "set_crypto") and uid in ADMIN_IDS:
+        kind = "card" if screen == "set_card" else "crypto"
+        if text == "-":
+            set_setting(f"{kind}_details", "")
+            await screen_admin(uid, f"✅ {kind.capitalize()} details restored to the default.")
+        else:
+            set_setting(f"{kind}_details", text)
+            await screen_admin(uid, f"✅ {kind.capitalize()} details updated.")
+        return
+
+    # Spotify account data
+    order = pick_order(uid, ("wait_email", "wait_password"), newest=False)
+    if order:
+        if order["status"] == "wait_email":
+            if not EMAIL_RE.match(text):
+                await send(uid, "That doesn't look like an email address. Please send it like <code>name@mail.com</code>")
+                return
+            update_order(order["id"], email=text, status="wait_password")
+            await send(
+                uid,
+                "Thanks! Now send the <b>password</b> of the account 🔑\n\n"
+                "🔒 The bot doesn't save your password and your message with it is deleted from the chat - "
+                "it is sent to the seller only. We recommend changing it after activation.",
+                kb([B_MENU]),
+            )
             return
-        update_order(order["id"], email=email, status="wait_password")
-        await message.answer(tr(lang, "ask_password"))
-        return
-
-    if order["status"] == "wait_password":
-        password = message.text.strip()
+        # wait_password
         try:
-            await message.delete()  # убираем пароль из чата
+            await message.delete()
         except Exception:
             pass
         update_order(order["id"], status="submitted")
         order = get_order(order["id"])
-        sent = await notify_admins(order, user, order["email"], password)
+        p = order_plan(order)
+        caption = (
+            f"🔐 <b>Account data - order #{order['id']}</b>\n\n"
+            f"🎯 <b>To do:</b> {h(todo_text(p) if p else 'Check the plan manually.')}\n"
+            f"👤 Buyer: {who_html(uid, user.username, user.full_name)}\n"
+            f"📧 Email: <code>{h(order['email'] or '')}</code>\n"
+            f"🔑 Password: <code>{h(text)}</code>"
+        )
+        sent = await to_admins(caption, ikb(("✅ Mark completed", f"dn:{order['id']}")))
         if sent:
-            await message.answer(
-                tr(lang, "order_accepted", oid=order["id"]),
-                reply_markup=menu_kb(lang), disable_web_page_preview=True,
+            await send(
+                uid,
+                f"🎉 <b>Order #{order['id']} accepted!</b>\n\n{WAIT_NOTE}",
+                main_kb(uid),
             )
         else:
-            await message.answer(
-                tr(lang, "admin_fail", oid=order["id"], support=SUPPORT_URL),
-                disable_web_page_preview=True,
-            )
-
-
-async def notify_admins(order, user, email, password):
-    # Сообщение для продавца всегда на русском
-    p = PLANS[order["plan_id"]]
-    who = f"<a href=\"tg://user?id={user.id}\">{h(user.full_name)}</a>"
-    if user.username:
-        who += f" (@{h(user.username)})"
-    text = (
-        f"🆕 <b>Новый заказ #{order['id']}!</b>\n\n"
-        f"📦 Сервис: <b>{h(plan_title(p))}</b>\n"
-        f"🏷 Тариф: {h(plabel(p, 'ru'))}\n"
-        f"⏱ Оформить на: <b>{h(pperiod(p, 'ru'))}</b>\n"
-        f"💰 Оплачено: {money(order['price_cents'])}\n\n"
-        f"👤 Покупатель: {who}\n"
-        f"📧 Email: <code>{h(email)}</code>\n"
-        f"🔑 Пароль: <code>{h(password)}</code>"
-    )
-    k = types.InlineKeyboardMarkup()
-    k.add(btn("✅ Заказ выполнен", f"done:{order['id']}"))
-    sent = 0
-    for aid in ADMIN_IDS:
-        try:
-            await bot.send_message(aid, text, reply_markup=k)
-            sent += 1
-        except Exception as e:
-            # Админ должен хотя бы раз нажать /start у бота, иначе Telegram не даст написать ему первым
-            print(f"Не удалось отправить админу {aid}:", e, flush=True)
-    return sent
-
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("done:"))
-async def cb_done(call: types.CallbackQuery):
-    if call.from_user.id not in ADMIN_IDS:
-        await call.answer("Только для админов", show_alert=True)
+            await send(uid, f'⚠️ Order #{order["id"]} is paid, but we could not reach the seller. Please contact <a href="{SUPPORT_URL}">support</a> and mention the order number.')
+        ctx[uid] = {"screen": "main"}
         return
+
+    await send(uid, "Please use the menu buttons below 👇", main_kb(uid))
+    ctx[uid] = {"screen": "main"}
+
+
+# ---------------------------------------------------------------- admin callbacks
+async def edit_admin_msg(call, suffix, markup=None):
+    m = call.message
     try:
-        oid = int(call.data.split(":", 1)[1])
+        body = m.html_text or ""
+        if m.photo or m.document or m.caption is not None:
+            await m.edit_caption(caption=body + suffix, reply_markup=markup)
+        else:
+            await m.edit_text(body + suffix, reply_markup=markup)
+    except Exception as e:
+        print("Could not edit admin message:", e)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data[:3] in ("ap:", "rj:", "dn:"))
+async def cb_admin(call: types.CallbackQuery):
+    if call.from_user.id not in ADMIN_IDS:
+        await call.answer("Admins only", show_alert=True)
+        return
+    action, _, raw = call.data.partition(":")
+    try:
+        oid = int(raw)
     except ValueError:
         await call.answer()
         return
     order = get_order(oid)
     if not order:
-        await call.answer("Заказ не найден", show_alert=True)
+        await call.answer("Order not found", show_alert=True)
         return
-    if order["status"] == "done":
-        await call.answer("Уже отмечен выполненным")
-        return
-    update_order(oid, status="done")
+    buyer = order["user_id"]
+    p = order_plan(order)
+    admin_name = h(call.from_user.full_name)
 
-    buyer = get_bot_user(order["user_id"])
-    buyer_lang = buyer["lang"] if buyer and buyer["lang"] in LANGS else "ru"
-    notify_on = (buyer["notify"] if buyer else 1) == 1
+    if action == "ap":
+        creds = bool(p and needs_credentials(p))
+        new_status = "wait_email" if creds else "submitted"
+        if not transition(oid, ("claimed",), new_status, confirmed_at=now_iso(), paid_at=now_iso()):
+            await call.answer("Already processed", show_alert=True)
+            return
+        await call.answer("Payment confirmed ✅")
+        if creds:
+            await edit_admin_msg(call, f"\n\n✅ <b>Payment confirmed</b> by {admin_name}. Waiting for the buyer's Spotify account data.")
+            ctx[buyer] = {"screen": "await"}
+            await send(
+                buyer,
+                f"✅ <b>Payment confirmed!</b> (order #{oid})\n\n"
+                f"To activate <b>{h(plan_title(p))}</b>, send the <b>email</b> of your Spotify account as a message 👇",
+                kb([B_MENU]),
+            )
+        else:
+            await edit_admin_msg(call, f"\n\n✅ <b>Payment confirmed</b> by {admin_name}. Deliver the order, then mark it completed.",
+                                 ikb(("✅ Mark completed", f"dn:{oid}")))
+            ctx[buyer] = {"screen": "main"}
+            await send(buyer, f"✅ <b>Payment confirmed!</b> (order #{oid})\n\n{WAIT_NOTE}", main_kb(buyer))
 
-    note = "" if notify_on else "\n" + tr("ru", "notif_off_note")
-    await call.answer("Отмечено выполненным ✅")
-    try:
-        await call.message.edit_text(
-            call.message.html_text + "\n\n✅ <b>ВЫПОЛНЕНО</b>" + note, reply_markup=None
+    elif action == "rj":
+        if not transition(oid, ("claimed",), "new", proof_file_id=None, proof_type=None):
+            await call.answer("Already processed", show_alert=True)
+            return
+        await call.answer("Rejected")
+        await edit_admin_msg(call, f"\n\n❌ <b>Rejected</b> by {admin_name}.")
+        ctx[buyer] = {"screen": "pay", "oid": oid}
+        await send(
+            buyer,
+            f"❌ <b>We could not find your payment for order #{oid}.</b>\n\n"
+            "Please check the transfer and send a new, clear screenshot, then press «✅ I've Paid» again. "
+            f'Or contact <a href="{SUPPORT_URL}">support</a>.',
+            kb([B_PAID], [B_CHANGE, B_CANCEL], [B_MENU]),
         )
-    except Exception:
-        pass
 
-    if not notify_on:
-        return
-    p = PLANS.get(order["plan_id"])
-    name = plan_title(p) if p else "-"
-    try:
-        await bot.send_message(
-            order["user_id"],
-            tr(buyer_lang, "order_done", oid=oid, title=h(name), support=SUPPORT_URL),
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        print("Не удалось уведомить покупателя:", e, flush=True)
-
-
-# ---------- Мои заказы ----------
-def orders_text(user_id, lang):
-    rows = user_orders(user_id)
-    if not rows:
-        return tr(lang, "orders_title") + "\n" + tr(lang, "no_orders")
-    lines = [tr(lang, "orders_title")]
-    for r in rows:
-        p = PLANS.get(r["plan_id"])
-        name = f"{plan_title(p)} — {plabel(p, lang)}" if p else r["plan_id"]
-        status = tr(lang, "st_" + r["status"]) if ("st_" + r["status"]) in T["ru"] else r["status"]
-        lines.append(f"\n<b>#{r['id']}</b> · {h(name)}\n{status}")
-    return "\n".join(lines)
+    elif action == "dn":
+        if not transition(oid, ("submitted",), "done", done_at=now_iso()):
+            await call.answer("Already completed or not ready", show_alert=True)
+            return
+        await call.answer("Marked completed ✅")
+        await edit_admin_msg(call, f"\n\n✅ <b>COMPLETED</b> by {admin_name}.")
+        name = h(order_name(order))
+        try:
+            await send(
+                buyer,
+                f"🎉 <b>Order #{oid} is completed!</b>\n\n{name}\n\n"
+                f'Enjoy! If anything looks wrong, contact <a href="{SUPPORT_URL}">support</a> with your order number.',
+                main_kb(buyer),
+            )
+        except Exception as e:
+            print("Could not notify the buyer:", e)
 
 
-# ---------- Админ-команды ----------
-@dp.message_handler(commands=["orders"])
-async def cmd_admin_orders(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    rows = all_orders()
-    if not rows:
-        await message.answer("Заказов пока нет.")
-        return
-    lines = ["📋 <b>Последние заказы</b>\n"]
-    for r in rows:
-        p = PLANS.get(r["plan_id"])
-        name = f"{plan_title(p)} — {plabel(p, 'ru')}" if p else r["plan_id"]
-        who = f"@{h(r['username'])}" if r["username"] else f"id {r['user_id']}"
-        st = tr("ru", "st_" + r["status"]) if ("st_" + r["status"]) in T["ru"] else r["status"]
-        lines.append(f"#{r['id']} · {h(name)} · {money(r['price_cents'])} · {who}\n   {st}")
-    await message.answer("\n".join(lines)[:4000])
-
-
-# ---------- Flask: страницы после оплаты ----------
+# ---------------------------------------------------------------- web (health check for the host)
 app = Flask(__name__)
 
 
@@ -1185,21 +1099,11 @@ def index():
     return "ok", 200
 
 
-@app.route("/success.html")
-def success_page():
-    return "<h2>Оплата прошла! / Payment successful</h2><p>Вернитесь в Telegram и нажмите «Я оплатил».</p>"
-
-
-@app.route("/cancel.html")
-def cancel_page():
-    return "<h2>Оплата отменена / Payment cancelled</h2><p>Вернитесь в Telegram и попробуйте снова.</p>"
-
-
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
 
 
-# ---------- Запуск ----------
+# ---------------------------------------------------------------- start
 if __name__ == "__main__":
     init_db()
     threading.Thread(target=run_flask, daemon=True).start()
